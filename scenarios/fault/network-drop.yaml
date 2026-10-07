@@ -1,0 +1,28 @@
+# 网络故障场景：下行 50% 丢弃 + 800ms 延迟 → 恢复
+# 用途：E2E T11（网络劣化与恢复）/ 消息级注入链路验证
+# 说明：network_drop percent=0 即解除丢弃注入；network_reconnect 兜底解除断网
+scenario:
+  id: fault-network-drop
+  version: 1
+  description: 网络故障——50% 下行丢弃与 800ms 延迟注入后恢复（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 90
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 10s, action: network_drop, percent: 50 }
+  - { at: 30s, action: network_delay, ms: 800, jitterMs: 200 }
+  - { at: 60s, action: network_drop, percent: 0 }
+  - { at: 90s, action: return_home, rthAltitude: 100 }
+  - { at: 140s, action: land }

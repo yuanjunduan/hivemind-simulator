@@ -63,7 +63,9 @@ public enum DiagnosticCode {
     /** 监控器 MQTT 未连接 */
     MONITOR_MQTT_NOT_CONNECTED("M-1", "监控器 MQTT 未连接", "monitor"),
     /** 模拟器推断行为（未得到 DJI 官方文档确认，选择最优方案实现，待真机验证） */
-    MONITOR_SIMULATOR_INFERENCE("M-2", "模拟器推断（待验证）", "monitor");
+    MONITOR_SIMULATOR_INFERENCE("M-2", "模拟器推断（待验证）", "monitor"),
+    /** 生命周期状态未命中文档化映射组合（实施方案 §2.5.2 推导表之外，已兜底） */
+    MONITOR_LIFECYCLE_UNMAPPED("M-3", "生命周期状态未命中映射", "monitor");
 
     private final String code;
     private final String description;

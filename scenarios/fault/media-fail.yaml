@@ -1,0 +1,29 @@
+# 媒体故障场景：推流停止 + 上传 100% 失败 → 恢复
+# 用途：E2E T12（媒体链路故障与恢复）/ FfmpegWhipPusher 停止门与 MediaUploader 失败率验证
+# 说明：video_stream_stop 会停止全部活跃推流并阻断新推流；media_upload_fail percent=0 解除
+scenario:
+  id: fault-media-fail
+  version: 1
+  description: 媒体故障——推流停止与上传全失败注入后恢复（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 90
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 10s, action: video_stream_stop }
+  - { at: 20s, action: media_upload_fail, percent: 100 }
+  - { at: 60s, action: media_upload_fail, percent: 0 }
+  - { at: 65s, action: video_stream_recover }
+  - { at: 90s, action: return_home, rthAltitude: 100 }
+  - { at: 140s, action: land }

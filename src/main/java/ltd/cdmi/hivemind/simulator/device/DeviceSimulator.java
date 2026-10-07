@@ -23,8 +23,12 @@ import ltd.cdmi.dji.cloudapi.sdk.model.DroneModel;
 import ltd.cdmi.dji.cloudapi.sdk.model.PayloadType;
 import ltd.cdmi.dji.cloudapi.sdk.model.RcModel;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.DrcUpMethod;
+import ltd.cdmi.hivemind.simulator.adapter.dji.DjiTelemetryProjector;
 import ltd.cdmi.hivemind.simulator.config.RuntimeConfig;
 import ltd.cdmi.hivemind.simulator.config.SimulatorProperties;
+import ltd.cdmi.hivemind.simulator.core.clock.ClockProperties;
+import ltd.cdmi.hivemind.simulator.core.clock.ClockScheduler;
+import ltd.cdmi.hivemind.simulator.core.clock.PublishRateGate;
 import ltd.cdmi.hivemind.simulator.device.osd.DockOsdBuilder;
 import ltd.cdmi.hivemind.simulator.device.osd.DroneOsdBuilder;
 import ltd.cdmi.hivemind.simulator.device.osd.OsdContext;
@@ -37,6 +41,7 @@ import ltd.cdmi.hivemind.simulator.mqtt.DrcMessage;
 import ltd.cdmi.hivemind.simulator.mqtt.MqttClientManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -44,9 +49,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * 设备模拟器：0.5Hz 构造并发布 Dock + Drone 的 OSD 遥测数据。
@@ -73,9 +75,24 @@ public class DeviceSimulator {
     private final DiagnosticLogRecorder diagnosticRecorder;
     private final DockTopicSchema dockTopicSchema;
     private final AiSimulator aiSimulator;
+    private final ClockScheduler clockScheduler;
+    /** V3.0 遥测投影钩子（§2.8；兼容构造器场景为 null，钩子跳过） */
+    private final DjiTelemetryProjector telemetryProjector;
 
-    private ScheduledExecutorService scheduler;
+    /** T1.10 加速模式报文频率封顶闸门（ADR-5；REALTIME 倍率 ≤1 恒定放行） */
+    private final PublishRateGate publishRateGate;
 
+    /** OSD 周期任务句柄（T1.3 替换点①：由 ClockScheduler 按逻辑时间调度） */
+    private ClockScheduler.Cancellable osdTask;
+
+    /**
+     * Spring 注入构造器（T1.3 替换点①）：2s OSD 上报改由统一 {@link ClockScheduler} 调度，
+     * 逻辑时间使加速模式下 OSD 周期自动同倍缩放。
+     * <p>T1.8 起新增 {@link DjiTelemetryProjector}（§2.8）：publishOsd() 末尾投影统一快照。</p>
+     * <p>T1.10 起新增 {@link ClockProperties}（ADR-5）：加速模式下 publishOsd 整轮按
+     * {@code simulation.mqtt.publish-rate-cap-hz}（缺省 2Hz）做物理时间封顶。</p>
+     */
+    @Autowired
     public DeviceSimulator(SimulatorProperties props, MqttClientManager mqtt, DeviceState state,
                            ObjectMapper objectMapper, RuntimeConfig runtimeConfig,
                            List<DockOsdBuilder> dockBuilders,
@@ -83,7 +100,10 @@ public class DeviceSimulator {
                            List<RcOsdBuilder> rcBuilders,
                            DiagnosticLogRecorder diagnosticRecorder,
                            DockTopicSchema dockTopicSchema,
-                           AiSimulator aiSimulator) {
+                           AiSimulator aiSimulator,
+                           ClockScheduler clockScheduler,
+                           DjiTelemetryProjector telemetryProjector,
+                           ClockProperties clockProperties) {
         this.props = props;
         this.mqtt = mqtt;
         this.state = state;
@@ -95,6 +115,50 @@ public class DeviceSimulator {
         this.diagnosticRecorder = diagnosticRecorder;
         this.dockTopicSchema = dockTopicSchema;
         this.aiSimulator = aiSimulator;
+        this.clockScheduler = clockScheduler;
+        this.telemetryProjector = telemetryProjector;
+        this.publishRateGate = new PublishRateGate(clockProperties.mqtt().publishRateCapHz());
+    }
+
+    /**
+     * 兼容构造器（T1.8 测试直接用）：缺省 {@link ClockProperties}（封顶 2Hz 兜底）。
+     * <p>REALTIME 调度器（倍率 1.0）下闸门恒定放行，与改造前行为一致。</p>
+     */
+    public DeviceSimulator(SimulatorProperties props, MqttClientManager mqtt, DeviceState state,
+                           ObjectMapper objectMapper, RuntimeConfig runtimeConfig,
+                           List<DockOsdBuilder> dockBuilders,
+                           List<DroneOsdBuilder> droneBuilders,
+                           List<RcOsdBuilder> rcBuilders,
+                           DiagnosticLogRecorder diagnosticRecorder,
+                           DockTopicSchema dockTopicSchema,
+                           AiSimulator aiSimulator,
+                           ClockScheduler clockScheduler,
+                           DjiTelemetryProjector telemetryProjector) {
+        this(props, mqtt, state, objectMapper, runtimeConfig, dockBuilders, droneBuilders, rcBuilders,
+                diagnosticRecorder, dockTopicSchema, aiSimulator, clockScheduler, telemetryProjector,
+                new ClockProperties(null, null, null));
+    }
+
+    /**
+     * 兼容构造器（测试直接 new 用）：自建 REALTIME 调度器，不启动后台 tick 线程——
+     * 与改造前「测试只手动调用 {@link #publishOsd()}、不等调度」的行为一致。
+     */
+    public DeviceSimulator(SimulatorProperties props, MqttClientManager mqtt, DeviceState state,
+                           ObjectMapper objectMapper, RuntimeConfig runtimeConfig,
+                           List<DockOsdBuilder> dockBuilders,
+                           List<DroneOsdBuilder> droneBuilders,
+                           List<RcOsdBuilder> rcBuilders,
+                           DiagnosticLogRecorder diagnosticRecorder,
+                           DockTopicSchema dockTopicSchema,
+                           AiSimulator aiSimulator) {
+        this(props, mqtt, state, objectMapper, runtimeConfig, dockBuilders, droneBuilders, rcBuilders,
+                diagnosticRecorder, dockTopicSchema, aiSimulator, newRealtimeScheduler(), null,
+                new ClockProperties(null, null, null));
+    }
+
+    /** 兼容构造器专用：REALTIME 自持调度器（倍率 1.0，后台 tick 已启动，与改造前的独立线程池行为等价） */
+    private static ClockScheduler newRealtimeScheduler() {
+        return ClockScheduler.realtime();
     }
 
     /**
@@ -144,13 +208,11 @@ public class DeviceSimulator {
         state.setDroneLongitude(runtimeConfig.getLocationLongitude());
         state.setDroneElevation(runtimeConfig.getLocationHeight());
 
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "osd-scheduler");
-            t.setDaemon(true);
-            return t;
-        });
-        scheduler.scheduleAtFixedRate(this::publishOsd, 2, OSD_INTERVAL_SECONDS, TimeUnit.SECONDS);
-        log.info("OSD 上报调度器已启动，频率 {}Hz", 1.0 / OSD_INTERVAL_SECONDS);
+        // T1.3 替换点①：2s OSD 由 ClockScheduler 按逻辑时间调度（REALTIME 首帧=1 个周期后，
+        // 与原 scheduleAtFixedRate(this::publishOsd, 2, 2, SECONDS) 语义一致）
+        osdTask = clockScheduler.register("device-osd", ClockScheduler.TaskSemantics.FIXED_RATE,
+                OSD_INTERVAL_SECONDS * 1000L, this::publishOsd);
+        log.info("OSD 上报已注册到统一调度器，周期 {}s（逻辑时间）", OSD_INTERVAL_SECONDS);
 
         // M-2 诊断日志：Dock OSD 分多条推送的字段分组方案为推断（DJI 文档仅提供 Dock1 示例，Dock3 具体分组未明确）
         String inference = "Dock OSD 分多条推送的字段分组方案：DJI 文档明确「机场的设备属性推送是分多条推送的」并提供 Dock1 示例（3 组），"
@@ -196,8 +258,8 @@ public class DeviceSimulator {
 
     @PreDestroy
     public void destroy() {
-        if (scheduler != null) {
-            scheduler.shutdownNow();
+        if (osdTask != null) {
+            osdTask.cancel();
         }
     }
 
@@ -205,9 +267,17 @@ public class DeviceSimulator {
      * 构造并发布 Dock + Drone OSD 报文。
      * <p>异常隔离策略：网关 OSD / 飞行器 OSD / DRC 事件各自独立 try-catch，
      * 任一推送异常不影响其他推送，且捕获 Throwable（含 Error）防止调度器因未捕获异常停止。</p>
+     * <p>T1.10（ADR-5）：加速模式下整轮推送由 {@link PublishRateGate} 做物理时间封顶
+     * （缺省 ≤2Hz）；REALTIME 恒定放行，行为与改造前逐位一致。</p>
      */
     public void publishOsd() {
         if (!state.isOnline()) {
+            return;
+        }
+        // T1.10（ADR-5）：加速模式下整轮 OSD/DRC 批推送按物理时间封顶（缺省 ≤2Hz），
+        // 报文间以"逻辑时间跳进"携带最新状态；REALTIME（倍率 ≤1）恒定放行，行为与改造前逐位一致。
+        // 离散事件（指令触发推送、flighttask_progress/return_home_info 等）不经此闸门，不降采样。
+        if (!publishRateGate.tryAcquire(clockScheduler.clock().speed())) {
             return;
         }
         OsdContext ctx = new OsdContext(state, props, runtimeConfig);
@@ -246,6 +316,12 @@ public class DeviceSimulator {
             } catch (Throwable t) {
                 log.error("DRC 事件推送异常: {}", t.getMessage(), t);
             }
+        }
+
+        // V3.0 §2.8 遥测投影钩子：每次 OSD 发布后生成统一快照（对现有核心文件的唯一侵入点）；
+        // 投影器内部全捕获异常，绝不影响 OSD 上报与调度器稳定性
+        if (telemetryProjector != null) {
+            telemetryProjector.onOsdPublished(state);
         }
     }
 
@@ -575,7 +651,7 @@ public class DeviceSimulator {
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("bid", UUID.randomUUID().toString());
         envelope.put("tid", UUID.randomUUID().toString());
-        envelope.put("timestamp", System.currentTimeMillis());
+        envelope.put("timestamp", clockScheduler.clock().now().toEpochMilli());
         envelope.put("gateway", gatewaySn);
         envelope.put("data", data);
         try {

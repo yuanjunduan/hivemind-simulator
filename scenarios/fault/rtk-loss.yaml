@@ -1,0 +1,26 @@
+# RTK 丢失故障场景：RTK 固定解丢失降级 GPS 定位 → 恢复固定解
+# 用途：E2E T10（RTK 降级与恢复）/ positionState 2→1→2 链路验证
+scenario:
+  id: fault-rtk-loss
+  version: 1
+  description: RTK 丢失故障——降级 GPS 定位后恢复固定解 + RTK_LOST 告警（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 90
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 30s, action: rtk_loss }
+  - { at: 60s, action: rtk_recover }
+  - { at: 90s, action: return_home, rthAltitude: 100 }
+  - { at: 140s, action: land }

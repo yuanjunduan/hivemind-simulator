@@ -34,8 +34,12 @@ import ltd.cdmi.dji.cloudapi.sdk.protocol.envelope.EventEnvelope;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.EventMethod;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.RequestsMethod;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.ServiceMethod;
+import ltd.cdmi.hivemind.simulator.adapter.dji.DjiMissionStepMapper;
 import ltd.cdmi.hivemind.simulator.config.RuntimeConfig;
 import ltd.cdmi.hivemind.simulator.config.SimulatorProperties;
+import ltd.cdmi.hivemind.simulator.core.clock.ClockScheduler;
+import ltd.cdmi.hivemind.simulator.core.engine.flight.lite.LiteFlightEngine;
+import ltd.cdmi.hivemind.simulator.core.engine.mission.MissionPlan;
 import ltd.cdmi.hivemind.simulator.device.DeviceMode;
 import ltd.cdmi.hivemind.simulator.device.DeviceState;
 import ltd.cdmi.dji.cloudapi.sdk.model.DockModel;
@@ -45,19 +49,18 @@ import ltd.cdmi.hivemind.simulator.mqtt.DockTopicSchema;
 import ltd.cdmi.hivemind.simulator.mqtt.MqttClientManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -80,34 +83,14 @@ public class WaylineTaskSimulator {
     // ==================== 航线位置连续插值常量（TC-WAYLINE-024~026） ====================
     /** 插值调度周期（毫秒）：与 OSD 0.5Hz 上报频率对齐，OSD 每次上报均反映插值结果 */
     private static final long INTERP_INTERVAL_MILLIS = 500;
-    /** 插值水平速度（米/秒）：与 DRC 杆量积分满杆速度一致（TC-DRC-061） */
-    private static final double INTERP_HORIZONTAL_SPEED_MPS = 10.0;
-    /** 插值垂直速度（米/秒）：起飞/降落/爬升阶段 */
-    private static final double INTERP_VERTICAL_SPEED_MPS = 3.0;
-    /** 纬度每度对应米数（地球平均半径换算） */
-    private static final double METERS_PER_DEGREE_LATITUDE = 111320.0;
+    // 插值水平/垂直速度（10.0/3.0 m/s）已迁移至 LiteFlightEngine 参数化（simulation.flight.*，T1.6）
 
     /** 返航飞行模拟延迟（秒）：return_home 后延迟更新位置到机场，使平台可观察 mode_code=9 → 0 过渡 */
     private static final long RETURN_HOME_DELAY_SECONDS = 5;
 
-    /**
-     * Dock1 任务执行步骤序列（current_step 枚举按 Dock1 wayline.html）。
-     * <p>选择 6 个关键步骤（开机→起飞→返航检查→降落→退出工作模式→通知结果），
-     * 不含"航线执行中(23)"以保证三版本 stepIndex 语义一致（Dock2 文档跳过了该步骤）。</p>
-     * <p>序列：7=开机检查+开盖 → 22=触发执行航线(起飞) → 24=进入返航检查 → 25=飞行器降落机场 → 27=机场退出工作模式 → 33=通知任务结果</p>
-     * <p>核实依据：[Dock1 wayline.html] flighttask_progress progress.current_step 枚举</p>
-     */
-    private static final int[] STEP_SEQUENCE_DOCK1 = {7, 22, 24, 25, 27, 33};
-    /**
-     * Dock2/Dock3 任务执行步骤序列（current_step 枚举按 Dock2/Dock3 wayline.html）。
-     * <p>Dock2/3 比 Dock1 多 step 8(图传远程对频) 和 step 22(起飞机场检查降落机场准备状态)，
-     * 且 Dock2 跳过了 step 25(航线执行中)，故 Dock2/3 的 step 值整体偏移+2。</p>
-     * <p>序列：7=开机检查+开盖 → 24=触发执行航线(起飞) → 26=进入返航检查 → 27=飞行器降落机场 → 29=机场退出工作模式 → 35=通知任务结果</p>
-     * <p>核实依据：[Dock2 wayline.html] / [Dock3 wayline.html] flighttask_progress progress.current_step 枚举</p>
-     */
-    private static final int[] STEP_SEQUENCE_DOCK2_3 = {7, 24, 26, 27, 29, 35};
-    /** 每个步骤对应的 percent（与步骤序列一一对应，各 Dock 版本通用，6 步） */
-    private static final int[] STEP_PERCENTS = {5, 20, 60, 80, 90, 100};
+    // 任务执行 6 步序列（Dock1 / Dock2-3 两套）与展现进度（5/20/60/80/90/100）
+    // T1.7 起迁移至 adapter/dji 的 DjiMissionStepMapper 统一承载（含统一任务阶段映射），
+    // 本类经 stepSequence() / DjiMissionStepMapper.percentAt() 委托访问，序列内容与改造前逐位一致
 
     /**
      * break_reason 三版本共有枚举值集合（Dock1/Dock2/Dock3 wayline.html 交集）。
@@ -172,11 +155,14 @@ public class WaylineTaskSimulator {
     private final DiagnosticLogRecorder diagnosticRecorder;
     private final DockTopicSchema dockTopicSchema;
 
-    private final ScheduledExecutorService scheduler;
-    private final AtomicReference<ScheduledFuture<?>> progressTask = new AtomicReference<>();
+    private final ClockScheduler clockScheduler;
+    /** 飞行引擎（T1.6）：插值算法体委托（公式与改造前逐位一致，速度参数化） */
+    private final LiteFlightEngine flightEngine;
+    /** 任务进度调度句柄（T1.3 替换点②④：统一调度器注册/取消） */
+    private final AtomicReference<ClockScheduler.Cancellable> progressTask = new AtomicReference<>();
 
     /** 位置插值任务（TC-WAYLINE-024~026）：向 targetPosition 匀速推进 */
-    private final AtomicReference<ScheduledFuture<?>> interpTask = new AtomicReference<>();
+    private final AtomicReference<ClockScheduler.Cancellable> interpTask = new AtomicReference<>();
     /** 插值目标点（null 表示无目标，插值迭代空转） */
     private volatile double targetLatitude;
     private volatile double targetLongitude;
@@ -191,13 +177,21 @@ public class WaylineTaskSimulator {
     private volatile int currentStepIndex;
     private volatile boolean paused;
 
+    /**
+     * Spring 注入构造器（T1.3 替换点②③④）：3s 进度、500ms 插值、5s 返航延迟
+     * 统一改由 {@link ClockScheduler} 按逻辑时间调度（REALTIME 下首帧语义与原
+     * {@code scheduleAtFixedRate} / {@code schedule} 一致）。
+     */
+    @Autowired
     public WaylineTaskSimulator(SimulatorProperties props, MqttClientManager mqtt,
                                 DeviceState state, ObjectMapper objectMapper,
                                 ServiceCommandHandler commandHandler,
                                 MediaUploadSimulator mediaUploadSimulator,
                                 RuntimeConfig runtimeConfig,
                                 DiagnosticLogRecorder diagnosticRecorder,
-                                DockTopicSchema dockTopicSchema) {
+                                DockTopicSchema dockTopicSchema,
+                                ClockScheduler clockScheduler,
+                                LiteFlightEngine flightEngine) {
         this.props = props;
         this.mqtt = mqtt;
         this.state = state;
@@ -207,11 +201,28 @@ public class WaylineTaskSimulator {
         this.runtimeConfig = runtimeConfig;
         this.diagnosticRecorder = diagnosticRecorder;
         this.dockTopicSchema = dockTopicSchema;
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "wayline-scheduler");
-            t.setDaemon(true);
-            return t;
-        });
+        this.clockScheduler = clockScheduler;
+        this.flightEngine = flightEngine;
+    }
+
+    /**
+     * 兼容构造器（测试直接 new 用）：自建 REALTIME 调度器，不启动后台 tick 线程——
+     * 测试均通过反射直接调用任务体推进，不依赖真实调度。
+     */
+    public WaylineTaskSimulator(SimulatorProperties props, MqttClientManager mqtt,
+                                DeviceState state, ObjectMapper objectMapper,
+                                ServiceCommandHandler commandHandler,
+                                MediaUploadSimulator mediaUploadSimulator,
+                                RuntimeConfig runtimeConfig,
+                                DiagnosticLogRecorder diagnosticRecorder,
+                                DockTopicSchema dockTopicSchema) {
+        this(props, mqtt, state, objectMapper, commandHandler, mediaUploadSimulator,
+                runtimeConfig, diagnosticRecorder, dockTopicSchema, newRealtimeScheduler(), new LiteFlightEngine());
+    }
+
+    /** 兼容构造器专用：REALTIME 自持调度器（倍率 1.0，后台 tick 已启动，与改造前的独立线程池行为等价） */
+    private static ClockScheduler newRealtimeScheduler() {
+        return ClockScheduler.realtime();
     }
 
     @PostConstruct
@@ -223,7 +234,19 @@ public class WaylineTaskSimulator {
 
     @PreDestroy
     public void destroy() {
-        scheduler.shutdownNow();
+        // 取消本组件注册的调度任务（统一调度器的 tick 线程由其自身生命周期管理）
+        stopProgressTask();
+        stopInterpolation();
+    }
+
+    /** 供生命周期观察者（core/statemachine）只读查询：任务执行中（flighttask_execute 后、完成/取消前） */
+    public boolean isMissionActive() {
+        return currentFlightId != null;
+    }
+
+    /** 供生命周期观察者（core/statemachine）只读查询：任务暂停中（flighttask_pause 后、recovery 前） */
+    public boolean isMissionPaused() {
+        return paused;
     }
 
     // ==================== 命令处理 ====================
@@ -322,12 +345,12 @@ public class WaylineTaskSimulator {
     }
 
     /**
-     * 按当前 Dock 型号返回任务执行步骤序列。
+     * 按当前 Dock 型号返回任务执行步骤序列（T1.7 起由 {@link DjiMissionStepMapper} 统一承载）。
      * <p>Dock1 与 Dock2/Dock3 的 current_step 枚举存在偏移（Dock2/3 多"图传远程对频""起飞机场检查降落机场"两步），
      * 必须按型号选择，否则 step 值语义错误（如 Dock1 的 24=返航检查，在 Dock3 下 24=触发执行航线）。</p>
      */
     private int[] stepSequence() {
-        return runtimeConfig.getDockType() == DockModel.DOCK1 ? STEP_SEQUENCE_DOCK1 : STEP_SEQUENCE_DOCK2_3;
+        return DjiMissionStepMapper.sequenceOf(runtimeConfig.getDockType());
     }
 
     /**
@@ -607,7 +630,7 @@ public class WaylineTaskSimulator {
         // 地面态：取消任务 + 完整恢复 dock 状态
         stopProgressTask();
         if (currentFlightId != null) {
-            publishProgress("canceled", currentStepIndex, STEP_PERCENTS[Math.min(currentStepIndex, STEP_PERCENTS.length - 1)]);
+            publishProgress("canceled", currentStepIndex, DjiMissionStepMapper.percentAt(currentStepIndex));
         }
         resetDroneToHomeState();
         resetTaskState();
@@ -628,10 +651,9 @@ public class WaylineTaskSimulator {
         // 设置返航模式
         state.setDroneModeCode(9); // 自动返航
 
-        // 调度延迟任务：模拟返航飞行后更新位置到机场
-        ScheduledFuture<?> task = scheduler.schedule(this::completeReturnHome,
-                RETURN_HOME_DELAY_SECONDS, TimeUnit.SECONDS);
-        progressTask.set(task);
+        // 调度延迟任务（T1.3 替换点④）：模拟返航飞行后更新位置到机场
+        progressTask.set(clockScheduler.scheduleOnce("wayline-return-home",
+                RETURN_HOME_DELAY_SECONDS * 1000L, this::completeReturnHome));
 
         // M-2：return_home 命令的后续行为（不发 return_home_info、无进度上报）DJI 文档未明确，待真机验证
         String inference = "return_home命令后续行为：不发return_home_info（该事件含flight_id属航线任务关联）+ 无进度上报（flighttask_progress的返航阶段属航线任务）"
@@ -782,19 +804,108 @@ public class WaylineTaskSimulator {
         return Map.of("result", 0);
     }
 
+    // ==================== 内部意图入口（T1.9，实施方案 §2.9.2） ====================
+
+    /**
+     * 内部意图入口：启动任务（ExecuteWaypoints 意图）。
+     * <p>合并 {@link #handlePrepare} + {@link #handleExecute} 的状态语义（不改动原命令路径），
+     * 进度推进复用 {@link #startProgressTask()} 同一执行体——MQTT 协议路径与内部意图路径并存，
+     * 行为一致（实施方案 §2.9.2）。</p>
+     * <p>扩展字段：{@code plan.ext().get("rthAltitude")} 为数值时写入 state（供 return_home_info
+     * 轨迹构建；MissionPlan 无独立字段，与 DJI flighttask_prepare 的 rth_altitude 对应）。</p>
+     *
+     * @param plan 统一任务计划（missionId 作为 flightId，waypoints 由既有进度序列驱动）
+     * @return services_reply 风格结果（result=0）
+     */
+    public Map<String, Object> startMissionInternal(MissionPlan plan) {
+        Objects.requireNonNull(plan, "plan");
+
+        // —— prepare 语义（handlePrepare）：机场进入作业模式 ——
+        currentFlightId = plan.missionId();
+        Object rthAltitude = plan.ext().get("rthAltitude");
+        if (rthAltitude instanceof Number n) {
+            state.setRthAltitude(n.intValue());
+        }
+        state.setDockModeCode(4);
+        state.setCoverOpen(true);
+        state.setDroneChargeState(0);
+
+        // —— execute 语义（handleExecute）：任务开始 + 无人机起飞 ——
+        currentTrackId = UUID.randomUUID().toString();
+        currentStepIndex = 0;
+        paused = false;
+        currentTaskBid = null; // 内部路径无 MQTT 业务 id（envelope 自动兜底）
+
+        state.setDroneActivated(true); // 兼容 HiveMind 未显式发送 drone_open 的场景
+        state.setDroneInDock(false);
+        state.setDroneModeCode(4); // 自动起飞
+        state.setPutterExpanded(true);
+
+        startProgressTask();
+        log.info("任务启动（内部意图）: missionId={}, waypoints={}",
+                plan.missionId(), plan.waypoints().size());
+        return Map.of("result", 0);
+    }
+
+    /**
+     * 内部意图入口：暂停任务（PauseMission 意图）。复用 {@link #handlePause()}。
+     */
+    public Map<String, Object> pauseMissionInternal() {
+        return handlePause();
+    }
+
+    /**
+     * 内部意图入口：恢复任务（ResumeMission 意图）。复用 {@link #handleRecovery()}。
+     */
+    public Map<String, Object> resumeMissionInternal() {
+        return handleRecovery();
+    }
+
+    /**
+     * 内部意图入口：返航（ReturnHome / Land 意图）。复用 {@link #handleReturnHome()}。
+     *
+     * @param rthAltitude 返航高度（相对起飞点 ALT，m；null/≤0 保持 state 当前值）
+     * @return services_reply 风格结果（result=0）
+     */
+    public Map<String, Object> returnHomeInternal(Integer rthAltitude) {
+        if (rthAltitude != null && rthAltitude > 0) {
+            state.setRthAltitude(rthAltitude);
+        }
+        return handleReturnHome();
+    }
+
+    /**
+     * 场景引擎专用公开入口（W2 T2.4）：取消当前任务。
+     * <p>与 {@code flighttask_stop} 地面态处理一致：停止进度任务、上报 canceled 进度事件、
+     * 恢复归舱状态；用于场景 action {@code cancel_mission} 与 E2E「任务取消」用例。
+     * 无进行中任务时幂等（各复位步骤本身可空操作）。</p>
+     *
+     * @return services_reply 风格结果（result=0）
+     */
+    public Map<String, Object> cancelMissionInternal() {
+        stopProgressTask();
+        if (currentFlightId != null) {
+            publishProgress("canceled", currentStepIndex, DjiMissionStepMapper.percentAt(currentStepIndex));
+        }
+        resetDroneToHomeState();
+        resetTaskState();
+        log.info("[场景] 任务已取消: flightId={}", currentFlightId);
+        return Map.of("result", 0);
+    }
+
     // ==================== 进度推进 ====================
 
     private void startProgressTask() {
         stopProgressTask();
-        ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(this::advanceProgress,
-                PROGRESS_INTERVAL_SECONDS, PROGRESS_INTERVAL_SECONDS, TimeUnit.SECONDS);
-        progressTask.set(task);
+        // T1.3 替换点②：3s 进度由 ClockScheduler 按逻辑时间调度
+        progressTask.set(clockScheduler.register("wayline-progress", ClockScheduler.TaskSemantics.FIXED_RATE,
+                PROGRESS_INTERVAL_SECONDS * 1000L, this::advanceProgress));
     }
 
     private void stopProgressTask() {
-        ScheduledFuture<?> task = progressTask.getAndSet(null);
+        ClockScheduler.Cancellable task = progressTask.getAndSet(null);
         if (task != null) {
-            task.cancel(false);
+            task.cancel();
         }
     }
 
@@ -814,7 +925,7 @@ public class WaylineTaskSimulator {
             }
 
             int step = seq[currentStepIndex];
-            int percent = STEP_PERCENTS[currentStepIndex];
+            int percent = DjiMissionStepMapper.percentAt(currentStepIndex);
             String status = currentStepIndex < seq.length - 1 ? "in_progress" : "ok";
 
             // 根据步骤索引更新无人机状态（三版本 stepIndex 语义一致）
@@ -851,7 +962,7 @@ public class WaylineTaskSimulator {
         resetTaskState();
         log.info("任务完成: flightId={}", finishedFlightId);
 
-        // 触发媒体上传（使用 ForkJoinPool 异步执行，不阻塞 wayline-scheduler 线程池）
+        // 触发媒体上传（使用 ForkJoinPool 异步执行，不阻塞统一调度任务）
         if (finishedFlightId != null) {
             CompletableFuture.runAsync(() -> mediaUploadSimulator.simulateMediaUpload(finishedFlightId, 3));
         }
@@ -912,18 +1023,18 @@ public class WaylineTaskSimulator {
         targetHeight = height;
         hasTarget = true;
         if (interpTask.get() == null) {
-            ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(this::advanceInterpolation,
-                    INTERP_INTERVAL_MILLIS, INTERP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-            interpTask.set(task);
+            // T1.3 替换点③：500ms 插值由 ClockScheduler 按逻辑时间调度（任务体固定步长逻辑不变）
+            interpTask.set(clockScheduler.register("wayline-interp", ClockScheduler.TaskSemantics.FIXED_RATE,
+                    INTERP_INTERVAL_MILLIS, this::advanceInterpolation));
             log.debug("位置插值调度器已启动: 目标=({},{},{})", lat, lng, height);
         }
     }
 
     /** 停止插值调度器并清除目标点（任务完成/取消，TC-WAYLINE-026） */
     private void stopInterpolation() {
-        ScheduledFuture<?> task = interpTask.getAndSet(null);
+        ClockScheduler.Cancellable task = interpTask.getAndSet(null);
         if (task != null) {
-            task.cancel(false);
+            task.cancel();
         }
         hasTarget = false;
     }
@@ -939,34 +1050,16 @@ public class WaylineTaskSimulator {
             if (!hasTarget || currentFlightId == null) {
                 return;
             }
-            double stepMeters = INTERP_HORIZONTAL_SPEED_MPS * (INTERP_INTERVAL_MILLIS / 1000.0);
-            double verticalStep = INTERP_VERTICAL_SPEED_MPS * (INTERP_INTERVAL_MILLIS / 1000.0);
-
-            // 当前位置 → 目标点的水平位移（米，东北坐标系）
-            double dLatDeg = targetLatitude - state.getDroneLatitude();
-            double dLngDeg = targetLongitude - state.getDroneLongitude();
-            double metersPerDegreeLng = METERS_PER_DEGREE_LATITUDE
-                    * Math.cos(Math.toRadians(state.getDroneLatitude()));
-            double dNorth = dLatDeg * METERS_PER_DEGREE_LATITUDE;
-            double dEast = dLngDeg * metersPerDegreeLng;
-            double horizontalDistance = Math.hypot(dNorth, dEast);
-
-            double ratio;
-            if (horizontalDistance <= stepMeters || horizontalDistance == 0) {
-                ratio = 1.0;  // 剩余距离不足一个步长 → 精确到达（TC-WAYLINE-025）
-            } else {
-                ratio = stepMeters / horizontalDistance;
-            }
-
-            // 高度独立推进
-            double dh = targetHeight - state.getDroneHeight();
-            double newHeight = state.getDroneHeight()
-                    + (Math.abs(dh) <= verticalStep ? dh : Math.signum(dh) * verticalStep);
-
-            state.setDroneLatitude(state.getDroneLatitude() + dLatDeg * ratio);
-            state.setDroneLongitude(state.getDroneLongitude() + dLngDeg * ratio);
-            state.setDroneHeight(newHeight);
-            state.setDroneElevation(runtimeConfig.getLocationHeight() + newHeight);  // 椭球高 = 机场海拔 + 相对高度
+            // T1.6：算法体委托 LiteFlightEngine.stepTowards（公式与改造前逐位一致；速度参数化）
+            LiteFlightEngine.StepResult result = flightEngine.stepTowards(
+                    state.getDroneLatitude(), state.getDroneLongitude(), state.getDroneHeight(),
+                    targetLatitude, targetLongitude, targetHeight,
+                    flightEngine.horizontalSpeedMps(), flightEngine.verticalSpeedMps(),
+                    INTERP_INTERVAL_MILLIS / 1000.0);
+            state.setDroneLatitude(result.latitude());
+            state.setDroneLongitude(result.longitude());
+            state.setDroneHeight(result.altitude());
+            state.setDroneElevation(runtimeConfig.getLocationHeight() + result.altitude());  // 椭球高 = 机场海拔 + 相对高度
 
             log.debug("航线插值: 目标=({},{},{}), 当前=({},{},{})",
                     targetLatitude, targetLongitude, targetHeight,
@@ -1108,7 +1201,7 @@ public class WaylineTaskSimulator {
             return false;
         }
         int stepIndex = currentStepIndex;
-        int percent = STEP_PERCENTS[Math.min(stepIndex, STEP_PERCENTS.length - 1)];
+        int percent = DjiMissionStepMapper.percentAt(stepIndex);
         publishProgress("failed", stepIndex, percent, breakReason);
         return true;
     }
@@ -1451,7 +1544,7 @@ public class WaylineTaskSimulator {
             status.put("total_steps", seq.length);
             if (currentStepIndex < seq.length) {
                 status.put("current_step", seq[currentStepIndex]);
-                status.put("percent", STEP_PERCENTS[currentStepIndex]);
+                status.put("percent", DjiMissionStepMapper.percentAt(currentStepIndex));
             }
         }
         return status;

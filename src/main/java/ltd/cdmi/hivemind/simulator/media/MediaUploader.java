@@ -15,8 +15,10 @@
 
 package ltd.cdmi.hivemind.simulator.media;
 
+import ltd.cdmi.hivemind.simulator.core.fault.MediaFaultInjector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -58,6 +60,15 @@ public class MediaUploader {
             ".mp4", ".mov", ".avi"
     );
 
+    /** 媒体故障注入器（W2 T2.4；可选依赖——无注入时行为与 W1 完全一致） */
+    private volatile MediaFaultInjector mediaFaultInjector;
+
+    /** 注入媒体故障门（Spring 环境自动装配；测试直接 new 时保持 null） */
+    @Autowired(required = false)
+    public void setMediaFaultInjector(MediaFaultInjector injector) {
+        this.mediaFaultInjector = injector;
+    }
+
     /**
      * 上传单个文件到对象存储。
      *
@@ -73,6 +84,12 @@ public class MediaUploader {
         }
         if (!Files.exists(filePath) || !Files.isRegularFile(filePath)) {
             log.warn("文件不存在或非普通文件，跳过上传: {}", filePath);
+            return false;
+        }
+
+        MediaFaultInjector fault = this.mediaFaultInjector;
+        if (fault != null && fault.shouldFailUpload()) {
+            log.warn("[故障注入] 媒体上传失败注入生效: {}", filePath.getFileName());
             return false;
         }
 

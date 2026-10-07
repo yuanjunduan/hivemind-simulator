@@ -1,0 +1,27 @@
+# GPS 丢失故障场景：飞行中 GPS 丢失 → 悬停定位不可用 → 恢复
+# 用途：E2E T09（GPS 丢失与恢复）/ positionState 链路验证
+scenario:
+  id: fault-gps-loss
+  version: 1
+  description: GPS 丢失故障——positionState 0/1 切换 + GPS_LOST 告警（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 90
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 20s, action: goto, lng: 114.0579, lat: 22.5431, alt: 80, maxSpeed: 12 }
+  - { at: 60s, action: gps_loss }
+  - { at: 90s, action: gps_recover }
+  - { at: 120s, action: return_home, rthAltitude: 100 }
+  - { at: 170s, action: land }

@@ -1,0 +1,27 @@
+# 低电量故障场景：电量阶梯下降触发 LOW_BATTERY 告警并返航
+# 用途：E2E T08（低电量返航）/ HMS 告警链路验证
+scenario:
+  id: fault-battery-low
+  version: 1
+  description: 低电量故障——电量 95→25→18→8，触发告警并返航（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 95
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 10s, action: set_battery, value: 25 }
+  - { at: 30s, action: set_battery, value: 18 }
+  - { at: 60s, action: set_battery, value: 8 }
+  - { at: 65s, action: return_home, rthAltitude: 100 }
+  - { at: 120s, action: land }

@@ -1,0 +1,34 @@
+# 双机编队骨架场景（W2 仅骨架；多机协同执行排 W4）
+# 当前语义：多设备定义可解析校验通过；执行器按「场景内首个设备」分发单机动作，
+# 双机并行时间轴（per-event device 字段）在 W4 蛙跳/编队波次扩展 Schema v2 时启用。
+scenario:
+  id: swarm-two-drones-skeleton
+  version: 1
+  description: 双机编队骨架——验证多设备解析；协同时间轴 W4 填充
+  clock:
+    mode: accelerated
+    speed: 10
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 100
+      online: true
+  - id: drone-002
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 100
+      online: true
+
+events:
+  # W4 填充：多机协同动作（当前按首设备 drone-001 执行，骨架可运行）
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 30s, action: return_home, rthAltitude: 100 }
+  - { at: 80s, action: land }

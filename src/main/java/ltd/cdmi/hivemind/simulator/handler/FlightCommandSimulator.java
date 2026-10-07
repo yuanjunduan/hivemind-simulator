@@ -31,6 +31,8 @@ import ltd.cdmi.dji.cloudapi.sdk.protocol.method.EventMethod;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.ServiceMethod;
 import ltd.cdmi.hivemind.simulator.config.RuntimeConfig;
 import ltd.cdmi.hivemind.simulator.config.SimulatorProperties;
+import ltd.cdmi.hivemind.simulator.core.clock.ClockScheduler;
+import ltd.cdmi.hivemind.simulator.core.engine.flight.lite.LiteFlightEngine;
 import ltd.cdmi.hivemind.simulator.device.DeviceMode;
 import ltd.cdmi.hivemind.simulator.device.DeviceState;
 import ltd.cdmi.dji.cloudapi.sdk.model.DockModel;
@@ -40,6 +42,7 @@ import ltd.cdmi.hivemind.simulator.mqtt.DockTopicSchema;
 import ltd.cdmi.hivemind.simulator.mqtt.MqttClientManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -47,10 +50,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 
 /**
  * 指令飞行模拟器（drc.html）。
@@ -75,12 +74,7 @@ public class FlightCommandSimulator {
     // ==================== flyto/一键起飞位置连续插值常量（TC-FLY-033~035） ====================
     /** 插值调度周期（毫秒）：与 OSD 0.5Hz 上报频率对齐 */
     private static final long INTERP_INTERVAL_MILLIS = 500;
-    /** 插值垂直速度（米/秒）：与航线模式插值一致（TC-WAYLINE-024） */
-    private static final double INTERP_VERTICAL_SPEED_MPS = 3.0;
-    /** 插值速度下限（米/秒）：平台未下发 max_speed（0/负值）时的兜底速度 */
-    private static final double INTERP_FALLBACK_SPEED_MPS = 5.0;
-    /** 纬度每度对应米数（地球平均半径换算） */
-    private static final double METERS_PER_DEGREE_LATITUDE = 111320.0;
+    // 插值垂直速度（3.0 m/s）与速度兜底（5.0 m/s）已迁移至 LiteFlightEngine 参数化（simulation.flight.*，T1.6）
 
     /** 失联后降落/返航完成模拟延迟（秒） */
     private static final long RC_LOST_DELAY_SECONDS = 5;
@@ -103,14 +97,16 @@ public class FlightCommandSimulator {
     private final RuntimeConfig runtimeConfig;
     private final DiagnosticLogRecorder diagnosticRecorder;
     private final DockTopicSchema dockTopicSchema;
-    private final ScheduledExecutorService scheduler;
+    private final ClockScheduler clockScheduler;
+    /** 飞行引擎（T1.6）：flyto/一键起飞插值算法体委托（公式与改造前逐位一致，速度参数化） */
+    private final LiteFlightEngine flightEngine;
 
     /** fly_to_point 延迟任务引用（wayline_progress + wayline_ok），fly_to_point_stop 时取消 */
-    private ScheduledFuture<?> flyToPointProgressFuture;
-    private ScheduledFuture<?> flyToPointOkFuture;
+    private ClockScheduler.Cancellable flyToPointProgressFuture;
+    private ClockScheduler.Cancellable flyToPointOkFuture;
 
     /** 位置插值任务（TC-FLY-033~035）：向 flyto/一键起飞目标点匀速推进 */
-    private ScheduledFuture<?> interpFuture;
+    private ClockScheduler.Cancellable interpFuture;
     /** 插值目标点（椭球高语义）与水平速度 */
     private volatile double interpTargetLat;
     private volatile double interpTargetLng;
@@ -118,26 +114,56 @@ public class FlightCommandSimulator {
     private volatile double interpHorizontalSpeed;
     private volatile boolean interpActive;
 
+    /**
+     * Spring 注入构造器（T1.3 替换点⑥）：flyto 插值与进度/ok 事件延迟统一改由
+     * {@link ClockScheduler} 按逻辑时间调度（REALTIME 下与原 scheduleAtFixedRate/schedule 语义一致）。
+     */
+    @Autowired
     public FlightCommandSimulator(SimulatorProperties props, MqttClientManager mqtt,
                                    DeviceState state, RuntimeConfig runtimeConfig,
                                    DiagnosticLogRecorder diagnosticRecorder,
-                                   DockTopicSchema dockTopicSchema) {
+                                   DockTopicSchema dockTopicSchema,
+                                   ClockScheduler clockScheduler,
+                                   LiteFlightEngine flightEngine) {
         this.props = props;
         this.mqtt = mqtt;
         this.state = state;
         this.runtimeConfig = runtimeConfig;
         this.diagnosticRecorder = diagnosticRecorder;
         this.dockTopicSchema = dockTopicSchema;
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "flight-cmd-scheduler");
-            t.setDaemon(true);
-            return t;
-        });
+        this.clockScheduler = clockScheduler;
+        this.flightEngine = flightEngine;
+    }
+
+    /**
+     * 兼容构造器（测试直接 new 用）：自建 REALTIME 调度器（后台 tick 已启动）——
+     * 与改造前独立线程池等价的真实时间推进，插值端到端测试（sleep 等待推进）无需修改。
+     */
+    public FlightCommandSimulator(SimulatorProperties props, MqttClientManager mqtt,
+                                   DeviceState state, RuntimeConfig runtimeConfig,
+                                   DiagnosticLogRecorder diagnosticRecorder,
+                                   DockTopicSchema dockTopicSchema) {
+        this(props, mqtt, state, runtimeConfig, diagnosticRecorder, dockTopicSchema,
+                ClockScheduler.realtime(), new LiteFlightEngine());
     }
 
     @PreDestroy
     public void destroy() {
-        scheduler.shutdownNow();
+        // 取消本组件注册的调度任务（统一调度器的 tick 线程由其自身生命周期管理）
+        cancelFlyToPointFutures();
+        stopFlightInterpolation();
+    }
+
+    /** 取消 fly_to_point 两个延迟任务（fly_to_point_stop / 连续下发替换 / 组件销毁） */
+    private void cancelFlyToPointFutures() {
+        if (flyToPointProgressFuture != null) {
+            flyToPointProgressFuture.cancel();
+            flyToPointProgressFuture = null;
+        }
+        if (flyToPointOkFuture != null) {
+            flyToPointOkFuture.cancel();
+            flyToPointOkFuture = null;
+        }
     }
 
     // ==================== Service 指令处理 ====================
@@ -186,14 +212,7 @@ public class FlightCommandSimulator {
         state.setCurrentFlyToId("");
 
         // 取消已调度的延迟任务（wayline_progress / wayline_ok），阻止位置更新到目标点
-        if (flyToPointProgressFuture != null) {
-            flyToPointProgressFuture.cancel(false);
-            flyToPointProgressFuture = null;
-        }
-        if (flyToPointOkFuture != null) {
-            flyToPointOkFuture.cancel(false);
-            flyToPointOkFuture = null;
-        }
+        cancelFlyToPointFutures();
         // 停止位置插值（TC-FLY-035）：无人机悬停在当前位置（非起点、非目标点）
         stopFlightInterpolation();
 
@@ -308,6 +327,70 @@ public class FlightCommandSimulator {
         return Map.of("result", 0);
     }
 
+    // ==================== 内部意图入口（T1.9，实施方案 §2.9.2） ====================
+
+    /**
+     * 内部意图入口：飞向目标点（Goto 意图）。
+     * <p>与 {@link #handleFlyToPoint} 共用 {@link #scheduleFlyToPointProgress} 执行体——
+     * MQTT 协议路径与内部意图路径并存，行为一致（实施方案 §2.9.2）。</p>
+     *
+     * @param flyToId      业务侧生成的飞行任务 ID（非空）
+     * @param targetLat    目标纬度（WGS84 度）
+     * @param targetLng    目标经度（WGS84 度）
+     * @param targetHeight 目标高度（相对起飞点 ALT，m）
+     * @param maxSpeed     水平速度（m/s；≤0 沿用当前速度）
+     * @param bid          事件回带业务 id（内部路径传 null，SDK envelope 自动兜底）
+     * @return services_reply 风格结果（result=0）
+     */
+    public Map<String, Object> flyToInternal(String flyToId, double targetLat, double targetLng,
+                                             double targetHeight, double maxSpeed, String bid) {
+        state.setCurrentFlyToId(flyToId);
+        if (maxSpeed > 0) {
+            state.setMaxSpeed((int) maxSpeed);
+        }
+        state.setTargetLatitude(targetLat);
+        state.setTargetLongitude(targetLng);
+        state.setTargetHeight(targetHeight);
+
+        log.info("fly_to_point 内部意图: fly_to_id={}, target=({},{},{}), max_speed={}",
+                flyToId, targetLat, targetLng, targetHeight, maxSpeed);
+        scheduleFlyToPointProgress(bid, flyToId, targetLat, targetLng, targetHeight);
+        return Map.of("result", 0);
+    }
+
+    /**
+     * 内部意图入口：一键起飞（Takeoff 意图）。
+     * <p>与 {@link #handleTakeoffToPoint} 共用 {@link #scheduleTakeoffProgress} 执行体；
+     * 目标点水平坐标取当前位置（原地起飞），高度取 targetAltitude
+（相对起飞点 ALT，m）。</p>
+     *
+     * @param flightId       业务侧生成的任务 ID（非空）
+     * @param targetAltitude 目标高度（相对起飞点 ALT，m）
+     * @param maxSpeed       水平速度（m/s；≤0 沿用当前速度）
+     * @param bid            事件回带业务 id（内部路径传 null）
+     * @return services_reply 风格结果（result=0）
+     */
+    public Map<String, Object> takeoffToInternal(String flightId, double targetAltitude,
+                                                 double maxSpeed, String bid) {
+        String trackId = UUID.randomUUID().toString();
+        double startLat = state.getDroneLatitude();
+        double startLng = state.getDroneLongitude();
+
+        state.setCurrentFlightId(flightId);
+        state.setCurrentTrackId(trackId);
+        if (maxSpeed > 0) {
+            state.setMaxSpeed((int) maxSpeed);
+        }
+        state.setTargetLatitude(startLat);
+        state.setTargetLongitude(startLng);
+        state.setTargetHeight(targetAltitude);
+
+        log.info("takeoff_to_point 内部意图: flight_id={}, track_id={}, target_altitude={}",
+                flightId, trackId, targetAltitude);
+        scheduleTakeoffProgress(bid, flightId, trackId, startLat, startLng, targetAltitude, 0);
+        return Map.of("result", 0);
+    }
+
     /**
      * 处理 flight_authority_grab 指令（同步，无进度事件）。
      */
@@ -414,9 +497,10 @@ public class FlightCommandSimulator {
 
     /**
      * 启动位置插值：从当前位置向目标点匀速推进。
-     * <p>水平速度取指令 max_speed（≤0 时兜底 {@link #INTERP_FALLBACK_SPEED_MPS}），
-     * 垂直速度固定 {@link #INTERP_VERTICAL_SPEED_MPS}。0.5s 步进与 OSD 0.5Hz 对齐，
-     * 到达后自动停止（不越过）。事件时序（wayline_ok/task_finish）保持固定调度，与插值解耦。</p>
+     * <p>水平速度取指令 max_speed（≤0 时兜底 {@link LiteFlightEngine#fallbackSpeedMps()}），
+     * 垂直速度取 {@link LiteFlightEngine#verticalSpeedMps()}（参数化 simulation.flight.*，
+     * 默认与现状一致）。0.5s 步进与 OSD 0.5Hz 对齐，到达后自动停止（不越过）。
+     * 事件时序（wayline_ok/task_finish）保持固定调度，与插值解耦。</p>
      *
      * @param targetLat       目标纬度
      * @param targetLng       目标经度
@@ -428,11 +512,12 @@ public class FlightCommandSimulator {
         interpTargetLat = targetLat;
         interpTargetLng = targetLng;
         interpTargetElevation = targetElevation;
-        interpHorizontalSpeed = maxSpeedMps > 0 ? maxSpeedMps : INTERP_FALLBACK_SPEED_MPS;
+        interpHorizontalSpeed = maxSpeedMps > 0 ? maxSpeedMps : flightEngine.fallbackSpeedMps();
         interpActive = true;
-        if (interpFuture == null || interpFuture.isDone()) {
-            interpFuture = scheduler.scheduleAtFixedRate(this::advanceFlightInterpolation,
-                    INTERP_INTERVAL_MILLIS, INTERP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+        if (interpFuture == null) {
+            // T1.3 替换点⑥：500ms 插值由 ClockScheduler 按逻辑时间调度（任务体固定步长逻辑不变）
+            interpFuture = clockScheduler.register("flight-interp", ClockScheduler.TaskSemantics.FIXED_RATE,
+                    INTERP_INTERVAL_MILLIS, this::advanceFlightInterpolation);
         }
         log.debug("flyto 位置插值已启动: 目标=({},{},椭球高{}), 水平速度={}m/s",
                 targetLat, targetLng, targetElevation, interpHorizontalSpeed);
@@ -442,14 +527,15 @@ public class FlightCommandSimulator {
     private void stopFlightInterpolation() {
         interpActive = false;
         if (interpFuture != null) {
-            interpFuture.cancel(false);
+            interpFuture.cancel();
             interpFuture = null;
         }
     }
 
     /**
      * 插值迭代（TC-FLY-033/034）：向目标点推进一个步长。
-     * <p>水平沿当前位置→目标点直线推进（速度 × 0.5s），垂直独立推进（3m/s × 0.5s）。
+     * <p>T1.6：算法体委托 {@link LiteFlightEngine#stepTowards}（公式与改造前逐位一致，速度参数化）；
+     * 水平沿当前位置→目标点直线推进（速度 × 0.5s），垂直独立推进。
      * 剩余距离不足一个步长时精确置于目标点并自动停止插值（TC-FLY-033 到达即停）。</p>
      */
     private void advanceFlightInterpolation() {
@@ -457,35 +543,21 @@ public class FlightCommandSimulator {
             if (!interpActive) {
                 return;
             }
-            double stepMeters = interpHorizontalSpeed * (INTERP_INTERVAL_MILLIS / 1000.0);
-            double verticalStep = INTERP_VERTICAL_SPEED_MPS * (INTERP_INTERVAL_MILLIS / 1000.0);
+            // T1.6：算法体委托 LiteFlightEngine.stepTowards（公式与改造前逐位一致；速度参数化）
+            LiteFlightEngine.StepResult result = flightEngine.stepTowards(
+                    state.getDroneLatitude(), state.getDroneLongitude(), state.getDroneElevation(),
+                    interpTargetLat, interpTargetLng, interpTargetElevation,
+                    interpHorizontalSpeed, flightEngine.verticalSpeedMps(),
+                    INTERP_INTERVAL_MILLIS / 1000.0);
 
-            // 水平位移（米，东北坐标系）
-            double dLatDeg = interpTargetLat - state.getDroneLatitude();
-            double dLngDeg = interpTargetLng - state.getDroneLongitude();
-            double metersPerDegreeLng = METERS_PER_DEGREE_LATITUDE
-                    * Math.cos(Math.toRadians(state.getDroneLatitude()));
-            double dNorth = dLatDeg * METERS_PER_DEGREE_LATITUDE;
-            double dEast = dLngDeg * metersPerDegreeLng;
-            double horizontalDistance = Math.hypot(dNorth, dEast);
-
-            double ratio = horizontalDistance <= stepMeters ? 1.0 : stepMeters / horizontalDistance;
-
-            // 垂直推进（elevation 椭球高语义，height 由 elevation 换算）
             double baseHeight = runtimeConfig.getLocationHeight();
-            double dElev = interpTargetElevation - state.getDroneElevation();
-            double newElevation = state.getDroneElevation()
-                    + (Math.abs(dElev) <= verticalStep ? dElev : Math.signum(dElev) * verticalStep);
-
-            state.setDroneLatitude(state.getDroneLatitude() + dLatDeg * ratio);
-            state.setDroneLongitude(state.getDroneLongitude() + dLngDeg * ratio);
-            state.setDroneElevation(newElevation);
-            state.setDroneHeight(newElevation - baseHeight);  // 相对起飞点高度
+            state.setDroneLatitude(result.latitude());
+            state.setDroneLongitude(result.longitude());
+            state.setDroneElevation(result.altitude());
+            state.setDroneHeight(result.altitude() - baseHeight);  // 相对起飞点高度
 
             // 到达判定：水平已到目标点且垂直已到目标椭球高 → 精确落位并停止
-            boolean horizontalArrived = ratio >= 1.0;
-            boolean verticalArrived = Math.abs(interpTargetElevation - newElevation) < 1e-9;
-            if (horizontalArrived && verticalArrived) {
+            if (result.arrived()) {
                 state.setDroneLatitude(interpTargetLat);
                 state.setDroneLongitude(interpTargetLng);
                 state.setDroneElevation(interpTargetElevation);
@@ -515,12 +587,7 @@ public class FlightCommandSimulator {
         double remainingTime = maxSpeed > 0 ? distance / maxSpeed : 0;
 
         // 取消上一次的延迟任务（防止 fly_to_point 连续下发时旧任务残留）
-        if (flyToPointProgressFuture != null) {
-            flyToPointProgressFuture.cancel(false);
-        }
-        if (flyToPointOkFuture != null) {
-            flyToPointOkFuture.cancel(false);
-        }
+        cancelFlyToPointFutures();
 
         double baseHeight = runtimeConfig.getLocationHeight(); // 机场海拔（起飞点海拔）
 
@@ -531,7 +598,8 @@ public class FlightCommandSimulator {
         }
 
         // wayline_progress（执行中）
-        flyToPointProgressFuture = scheduler.schedule(() -> {
+        flyToPointProgressFuture = clockScheduler.scheduleOnce("flyto-progress",
+                PROGRESS_INTERVAL_SECONDS * 1000L, () -> {
             state.setDroneModeCode(5); // 飞行中
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("fly_to_id", flyToId);
@@ -542,10 +610,11 @@ public class FlightCommandSimulator {
             data.put("remaining_time", remainingTime);
             data.put("planned_path_points", pathPoints);
             publishEvent(EventMethod.FLY_TO_POINT_PROGRESS, bid, data);
-        }, PROGRESS_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        });
 
         // wayline_ok（完成）：事件保持固定调度，位置由插值独立推进（TC-FLY-033 事件与位置解耦）
-        flyToPointOkFuture = scheduler.schedule(() -> {
+        flyToPointOkFuture = clockScheduler.scheduleOnce("flyto-ok",
+                PROGRESS_INTERVAL_SECONDS * 2 * 1000L, () -> {
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("fly_to_id", flyToId);
             data.put("status", "wayline_ok");
@@ -555,7 +624,7 @@ public class FlightCommandSimulator {
             data.put("remaining_time", 0);
             data.put("planned_path_points", pathPoints);
             publishEvent(EventMethod.FLY_TO_POINT_PROGRESS, bid, data);
-        }, PROGRESS_INTERVAL_SECONDS * 2, TimeUnit.SECONDS);
+        });
     }
 
     /**
@@ -583,15 +652,15 @@ public class FlightCommandSimulator {
         }
 
         // task_ready（准备起飞）：激活无人机、出舱、mode_code=4（自动起飞）
-        scheduler.schedule(() -> {
+        clockScheduler.scheduleOnce("takeoff-ready", PROGRESS_INTERVAL_SECONDS * 1000L, () -> {
             state.setDroneActivated(true);
             state.setDroneInDock(false);
             state.setDroneModeCode(4); // 自动起飞
             publishTakeoffProgress(bid, flightId, trackId, "task_ready",
                     0, distance, remainingTime, pathPoints);
-        }, PROGRESS_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        });
         // wayline_progress（执行中：爬升到安全起飞高度，mode_code=5 飞行中）
-        scheduler.schedule(() -> {
+        clockScheduler.scheduleOnce("takeoff-progress", PROGRESS_INTERVAL_SECONDS * 2 * 1000L, () -> {
             state.setDroneModeCode(5); // 飞行中
             // 爬升段快照：插值垂直速度 3m/s 在 4s 时刻已推进约 12m，
             // 不足 security_takeoff_height 时补齐到安全高度（保证爬升段语义，插值继续向目标推进）
@@ -601,18 +670,18 @@ public class FlightCommandSimulator {
             }
             publishTakeoffProgress(bid, flightId, trackId, "wayline_progress",
                     0, distance, remainingTime, pathPoints);
-        }, PROGRESS_INTERVAL_SECONDS * 2, TimeUnit.SECONDS);
+        });
         // wayline_ok（到达目标点）：事件保持固定调度，位置/高度由插值独立推进（TC-FLY-034）
-        scheduler.schedule(() -> {
+        clockScheduler.scheduleOnce("takeoff-ok", PROGRESS_INTERVAL_SECONDS * 3 * 1000L, () -> {
             publishTakeoffProgress(bid, flightId, trackId, "wayline_ok",
                     1, 0, 0, pathPoints);
-        }, PROGRESS_INTERVAL_SECONDS * 3, TimeUnit.SECONDS);
+        });
         // task_finish（任务完成）：mode_code=5 飞行中，位置由插值推进
-        scheduler.schedule(() -> {
+        clockScheduler.scheduleOnce("takeoff-finish", PROGRESS_INTERVAL_SECONDS * 4 * 1000L, () -> {
             publishTakeoffProgress(bid, flightId, trackId, "task_finish",
                     1, 0, 0, pathPoints);
             state.setDroneModeCode(5); // 飞行中
-        }, PROGRESS_INTERVAL_SECONDS * 4, TimeUnit.SECONDS);
+        });
     }
 
     private void publishTakeoffProgress(String bid, String flightId, String trackId,
@@ -756,15 +825,15 @@ public class FlightCommandSimulator {
 
         switch (rcLostAction) {
             case 1 -> {
-                scheduler.schedule(this::completeRcLostLanding,
-                        RC_LOST_DELAY_SECONDS, TimeUnit.SECONDS);
+                clockScheduler.scheduleOnce("rc-lost-landing", RC_LOST_DELAY_SECONDS * 1000L,
+                        this::completeRcLostLanding);
                 // M-2：降落位置和后续状态未得到 DJI 文档确认，待真机验证
                 diagnosticRecorder.record(DiagnosticCode.MONITOR_SIMULATOR_INFERENCE, "trigger_rc_lost",
                         "rc_lost_action=1(降落)：原地降落(保持经纬度, height=0, mode_code=0, droneInDock=false)，DJI文档未明确降落位置和后续状态，待真机验证");
             }
             case 2 -> {
-                scheduler.schedule(this::completeRcLostReturnHome,
-                        RC_LOST_DELAY_SECONDS, TimeUnit.SECONDS);
+                clockScheduler.scheduleOnce("rc-lost-return-home", RC_LOST_DELAY_SECONDS * 1000L,
+                        this::completeRcLostReturnHome);
                 // M-2：不发return_home_info + 延迟归舱行为未得到 DJI 文档确认，待真机验证
                 diagnosticRecorder.record(DiagnosticCode.MONITOR_SIMULATOR_INFERENCE, "trigger_rc_lost",
                         "rc_lost_action=2(返航)：不发return_home_info(属航线管理事件) + 延迟归舱(mode_code=9→5s→位置=机场, inDock=true)，DJI文档未明确，待真机验证");

@@ -33,6 +33,8 @@ import ltd.cdmi.dji.cloudapi.sdk.protocol.method.DrcMethod;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.ServiceMethod;
 import ltd.cdmi.hivemind.simulator.config.RuntimeConfig;
 import ltd.cdmi.hivemind.simulator.config.SimulatorProperties;
+import ltd.cdmi.hivemind.simulator.core.clock.ClockScheduler;
+import ltd.cdmi.hivemind.simulator.core.engine.flight.lite.LiteFlightEngine;
 import ltd.cdmi.hivemind.simulator.device.DeviceState;
 import ltd.cdmi.dji.cloudapi.sdk.model.DockModel;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.DrcUpMethod;
@@ -45,6 +47,7 @@ import ltd.cdmi.hivemind.simulator.mqtt.MqttClientManager;
 import ltd.cdmi.hivemind.simulator.mqtt.DockTopicSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -84,20 +87,9 @@ public class DrcCommandHandler {
     // ==================== DRC 杆量积分运动学常量（TC-DRC-061~065） ====================
     // 简化速度模型：满杆对应最大速度，杆量线性归一化，非精确空气动力学。
     // 量级参考 M4D 实际性能（最大水平速度 21m/s、最大上升速度 8m/s），取偏保守值便于平台轨迹展示调试。
-    /** 满杆水平速度（米/秒）：pitch/roll 杆量归一化后的最大速度 */
-    private static final double STICK_MAX_HORIZONTAL_SPEED_MPS = 10.0;
-    /** 满杆垂直速度（米/秒）：throttle 杆量归一化后的最大速度 */
-    private static final double STICK_MAX_VERTICAL_SPEED_MPS = 5.0;
-    /** 满杆偏航角速度（度/秒）：yaw 杆量归一化后的最大角速度 */
-    private static final double STICK_MAX_YAW_RATE_DEG_S = 60.0;
-    /** 积分时间步上限（秒）：stick_control 断流后恢复时防瞬移，超过按上限计算 */
-    private static final double STICK_MAX_DT_SECONDS = 0.5;
+    // 速度/角速度/倾角/步长上限（10.0/5.0/60/15/0.5）已迁移至 LiteFlightEngine 参数化（simulation.flight.*，T1.6）
     /** 满杆量程：stick_control 杆量值域 [-65536, 65536] */
     private static final double STICK_FULL_RANGE = 65536.0;
-    /** 满杆姿态倾角（度）：attitudePitch/Roll 随杆量线性映射的最大倾角 */
-    private static final double STICK_MAX_TILT_DEG = 15.0;
-    /** 纬度每度对应米数（地球平均半径换算） */
-    private static final double METERS_PER_DEGREE_LATITUDE = 111320.0;
 
     private final SimulatorProperties props;
     private final MqttClientManager mqtt;
@@ -108,6 +100,9 @@ public class DrcCommandHandler {
     private final RuntimeConfig runtimeConfig;
     private final DockTopicSchema dockTopicSchema;
     private final AiSimulator aiSimulator;
+    private final ClockScheduler clockScheduler;
+    /** 飞行引擎（T1.6）：杆量积分算法体委托（公式与改造前逐位一致，速度参数化） */
+    private final LiteFlightEngine flightEngine;
 
     /** 按 method 注册的 DRC 指令处理器 */
     private final Map<String, Function<JsonNode, Map<String, Object>>> handlers = new ConcurrentHashMap<>();
@@ -117,13 +112,20 @@ public class DrcCommandHandler {
     /** M-2 诊断日志只记录一次（杆量符号约定），避免 5-10Hz 高频刷日志 */
     private volatile boolean stickDirectionLogged;
 
+    /**
+     * Spring 注入构造器（T1.3 替换点⑤）：杆量积分时间源改用统一逻辑时钟，
+     * 加速模式下 dt 随倍率缩放（REALTIME 下逻辑时间 ≈ 真实时间，行为等价）。
+     */
+    @Autowired
     public DrcCommandHandler(SimulatorProperties props, MqttClientManager mqtt,
                              ObjectMapper objectMapper, DeviceState state,
                              DiagnosticLogRecorder diagnosticRecorder,
                              CoverageRecorder coverageRecorder,
                              RuntimeConfig runtimeConfig,
                              DockTopicSchema dockTopicSchema,
-                             AiSimulator aiSimulator) {
+                             AiSimulator aiSimulator,
+                             ClockScheduler clockScheduler,
+                             LiteFlightEngine flightEngine) {
         this.props = props;
         this.mqtt = mqtt;
         this.objectMapper = objectMapper;
@@ -133,6 +135,29 @@ public class DrcCommandHandler {
         this.runtimeConfig = runtimeConfig;
         this.dockTopicSchema = dockTopicSchema;
         this.aiSimulator = aiSimulator;
+        this.clockScheduler = clockScheduler;
+        this.flightEngine = flightEngine;
+    }
+
+    /**
+     * 兼容构造器（测试直接 new 用）：自建 REALTIME 调度器（不启动后台线程）——
+     * 测试均向 {@link #integrateStick(long, int, int, int, int)} 注入确定性时间，
+     * 不经过 {@link #clockNanos()} 取时路径。
+     */
+    public DrcCommandHandler(SimulatorProperties props, MqttClientManager mqtt,
+                             ObjectMapper objectMapper, DeviceState state,
+                             DiagnosticLogRecorder diagnosticRecorder,
+                             CoverageRecorder coverageRecorder,
+                             RuntimeConfig runtimeConfig,
+                             DockTopicSchema dockTopicSchema,
+                             AiSimulator aiSimulator) {
+        this(props, mqtt, objectMapper, state, diagnosticRecorder, coverageRecorder,
+                runtimeConfig, dockTopicSchema, aiSimulator, newRealtimeScheduler(), new LiteFlightEngine());
+    }
+
+    /** 兼容构造器专用：REALTIME 自持调度器（倍率 1.0，后台 tick 已启动，与改造前的独立线程池行为等价） */
+    private static ClockScheduler newRealtimeScheduler() {
+        return ClockScheduler.realtime();
     }
 
     @PostConstruct
@@ -419,7 +444,7 @@ public class DrcCommandHandler {
             int pitch = data.path("pitch").asInt();
             int throttle = data.path("throttle").asInt();
             int yaw = data.path("yaw").asInt();
-            integrateStick(System.nanoTime(), roll, pitch, throttle, yaw);
+            integrateStick(clockNanos(), roll, pitch, throttle, yaw);
             return null;  // 无回包机制
         });
 
@@ -808,14 +833,22 @@ public class DrcCommandHandler {
     }
 
     /**
+     * 逻辑时钟纳秒（毫秒精度折算）——杆量积分时间源（T1.3 替换点⑤）。
+     * <p>加速模式下逻辑时间按倍率推进，杆量位移自动同倍缩放；积分步上限 0.5s 封顶防瞬移。</p>
+     */
+    private long clockNanos() {
+        return clockScheduler.clock().now().toEpochMilli() * 1_000_000L;
+    }
+
+    /**
      * stick_control 杆量积分：按杆量与消息时间间隔推进无人机位置/高度/偏航（TC-DRC-061~065）。
-     * <p>简化速度模型：满杆对应最大速度（{@link #STICK_MAX_HORIZONTAL_SPEED_MPS} 等），杆量线性归一化。
-     * 位移沿机头方向（attitudeYaw）投影到东北坐标系，经纬度按每度 111320 米换算。
-     * 首条消息仅建立时间基准（dt=0 不位移）；断流超过 {@link #STICK_MAX_DT_SECONDS} 按 0.5s 封顶防瞬移。
-     * 在舱（droneInDock）时忽略杆量，与真实设备一致。
+     * <p>T1.6：积分算法体已迁移至 {@link LiteFlightEngine#integrateSticks}（公式与改造前逐位一致，
+     * 速度参数化 simulation.flight.*）；本方法保留原签名与时间基准管理，测试可继续直接调用。</p>
+     * <p>简化速度模型：满杆对应最大速度，杆量线性归一化。首条消息仅建立时间基准（dt=0 不位移）；
+     * 断流超过 dt 上限按上限封顶防瞬移。在舱（droneInDock）时忽略杆量，与真实设备一致。</p>
      * <p>姿态角模拟：attitudePitch/Roll 随杆量线性映射倾角（前推杆机头下俯为负、右压杆右倾为正），
-     * 不积分（摇杆松开即回平，与真实无人机姿态响应一致）。
-     * <p>结果写入 {@link DeviceState}，由 OSD 0.5Hz 周期上报自然反映到 thing/product/{sn}/osd。
+     * 不积分（摇杆松开即回平，与真实无人机姿态响应一致）。</p>
+     * <p>结果写入 {@link DeviceState}，由 OSD 0.5Hz 周期上报自然反映到 thing/product/{sn}/osd。</p>
      *
      * @param nowNanos 当前时间戳（纳秒），测试可注入确定性时间
      */
@@ -836,7 +869,7 @@ public class DrcCommandHandler {
         // 计算积分时间步：首条建立基准（dt=0），断流按上限封顶
         double dt = 0.0;
         if (lastStickNanos != 0) {
-            dt = Math.min((nowNanos - lastStickNanos) / 1_000_000_000.0, STICK_MAX_DT_SECONDS);
+            dt = Math.min((nowNanos - lastStickNanos) / 1_000_000_000.0, flightEngine.dtCapSeconds());
             if (dt < 0) {
                 dt = 0.0;  // 时钟回退保护
             }
@@ -849,34 +882,20 @@ public class DrcCommandHandler {
         double nThrottle = clampStick(throttle);
         double nYaw = clampStick(yaw);
 
-        // 偏航积分（度，[0, 360) 归一化）
-        double heading = Math.floorMod(
-                (long) (state.getAttitudeYaw() + STICK_MAX_YAW_RATE_DEG_S * nYaw * dt), 360);
-        state.setAttitudeYaw(heading);
+        // T1.6：积分算法体委托 LiteFlightEngine（公式与改造前逐位一致）
+        LiteFlightEngine.StickMove move = flightEngine.integrateSticks(dt,
+                state.getDroneLatitude(), state.getDroneLongitude(), state.getAttitudeYaw(),
+                nPitch, nRoll, nThrottle, nYaw);
 
-        // 姿态倾角（瞬时映射，不积分）
-        state.setAttitudePitch(-nPitch * STICK_MAX_TILT_DEG);  // 前推杆机头下俯为负
-        state.setAttitudeRoll(nRoll * STICK_MAX_TILT_DEG);     // 右压杆右倾为正
+        state.setAttitudeYaw(move.heading());
+        state.setAttitudePitch(move.attitudePitch());
+        state.setAttitudeRoll(move.attitudeRoll());
 
         if (dt > 0) {
-            // 机体坐标系速度 → 东北坐标系位移（速度 × dt，heading 0=北，顺时针增大）
-            double rad = Math.toRadians(heading);
-            double vForward = STICK_MAX_HORIZONTAL_SPEED_MPS * nPitch;
-            double vRight = STICK_MAX_HORIZONTAL_SPEED_MPS * nRoll;
-            double east = (vForward * Math.sin(rad) + vRight * Math.cos(rad)) * dt;
-            double north = (vForward * Math.cos(rad) - vRight * Math.sin(rad)) * dt;
-
-            double latitude = state.getDroneLatitude() + north / METERS_PER_DEGREE_LATITUDE;
-            // 经度每度米数随纬度收缩
-            double metersPerDegreeLongitude = METERS_PER_DEGREE_LATITUDE * Math.cos(Math.toRadians(latitude));
-            double longitude = state.getDroneLongitude() + east / metersPerDegreeLongitude;
-
-            double dh = STICK_MAX_VERTICAL_SPEED_MPS * nThrottle * dt;
-
-            state.setDroneLatitude(latitude);
-            state.setDroneLongitude(longitude);
-            state.setDroneHeight(state.getDroneHeight() + dh);
-            state.setDroneElevation(state.getDroneElevation() + dh);  // 椭球高 = 机场海拔 + 相对高度
+            state.setDroneLatitude(move.latitude());
+            state.setDroneLongitude(move.longitude());
+            state.setDroneHeight(state.getDroneHeight() + move.deltaAltitude());
+            state.setDroneElevation(state.getDroneElevation() + move.deltaAltitude());  // 椭球高 = 机场海拔 + 相对高度
         }
 
         log.debug("DRC 杆量积分: roll={}, pitch={}, throttle={}, yaw={}, dt={}s, "

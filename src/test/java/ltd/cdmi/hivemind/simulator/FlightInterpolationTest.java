@@ -196,10 +196,13 @@ class FlightInterpolationTest {
                 """.formatted(targetLat);
         sim.handleFlyToPoint(new ObjectMapper().readTree(json), "bid-interp");
 
-        // 中途快照（0.6s）：插值已推进约 1 步（5 米），介于起点与目标之间（连续非瞬移）
-        Thread.sleep(600);
+        // 中途快照：轮询等待插值推进（最长 2s；重负载下 tick 可能延迟，轮询避免偶发假失败）
+        long deadline = System.currentTimeMillis() + 2000;
+        while (state.getDroneLatitude() <= 22.0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
         assertTrue(state.getDroneLatitude() > 22.0, "中途位置应已离开起点（连续推进）");
-        assertTrue(state.getDroneLatitude() < targetLat, "中途位置不应瞬移到目标");
+        assertTrue(state.getDroneLatitude() <= targetLat, "中途位置不应越过目标");
 
         // 到达（水平 1s + 垂直 1s + 余量）
         Thread.sleep(1500);

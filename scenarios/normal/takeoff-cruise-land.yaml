@@ -1,0 +1,25 @@
+# 标准单机闭环场景：起飞 → 巡航 → 返航 → 降落
+# 用途：场景引擎冒烟验证 / E2E T01-T03 基线
+scenario:
+  id: normal-takeoff-cruise-land
+  version: 1
+  description: 标准单机闭环——起飞/巡航/返航/降落（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 95
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 20s, action: goto, lng: 114.0579, lat: 22.5431, alt: 80, maxSpeed: 12 }
+  - { at: 80s, action: return_home, rthAltitude: 100 }
+  - { at: 140s, action: land }

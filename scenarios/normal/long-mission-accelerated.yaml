@@ -1,0 +1,26 @@
+# 长任务加速场景：30 分钟逻辑任务 / 10x 加速（物理 < 3 分钟）
+# 用途：验收口径「10x 下 30 分钟任务 <3 分钟完成」（可行性方案 §10）/ E2E T07
+scenario:
+  id: normal-long-mission-accelerated
+  version: 1
+  description: 长任务加速——30 分钟逻辑时间轴（10x）
+  clock:
+    mode: accelerated
+    speed: 10
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 100
+      online: true
+
+events:
+  - { at: 1m, action: takeoff, altitude: 80 }
+  - { at: 2m, action: goto, lng: 114.0579, lat: 22.5431, alt: 100, maxSpeed: 12 }
+  - { at: 15m, action: goto, lng: 114.1200, lat: 22.6000, alt: 120, maxSpeed: 12 }
+  - { at: 25m, action: return_home, rthAltitude: 120 }
+  - { at: 30m, action: land }

@@ -19,10 +19,12 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import ltd.cdmi.dji.cloudapi.sdk.protocol.method.ServiceMethod;
 import ltd.cdmi.hivemind.simulator.config.RuntimeConfig;
+import ltd.cdmi.hivemind.simulator.core.fault.MediaFaultInjector;
 import ltd.cdmi.hivemind.simulator.diagnostic.DiagnosticCode;
 import ltd.cdmi.hivemind.simulator.diagnostic.DiagnosticLogRecorder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedReader;
@@ -83,9 +85,18 @@ public class FfmpegWhipPusher {
     /** 活跃推流进程表：videoId → Process */
     private final Map<String, Process> activeProcesses = new ConcurrentHashMap<>();
 
+    /** 媒体故障注入器（W2 T2.4；可选依赖——无注入时行为与 W1 完全一致） */
+    private volatile MediaFaultInjector mediaFaultInjector;
+
     public FfmpegWhipPusher(RuntimeConfig runtimeConfig, DiagnosticLogRecorder diagnosticRecorder) {
         this.runtimeConfig = runtimeConfig;
         this.diagnosticRecorder = diagnosticRecorder;
+    }
+
+    /** 注入媒体故障门（Spring 环境自动装配；测试直接 new 时保持 null） */
+    @Autowired(required = false)
+    public void setMediaFaultInjector(MediaFaultInjector injector) {
+        this.mediaFaultInjector = injector;
     }
 
     @PostConstruct
@@ -262,6 +273,11 @@ public class FfmpegWhipPusher {
      */
     public boolean startPush(String videoId, String url, String videoFile, int urlType) {
         if (!isPushAvailable(urlType)) {
+            return false;
+        }
+        MediaFaultInjector fault = this.mediaFaultInjector;
+        if (fault != null && fault.isVideoStopped()) {
+            log.warn("[故障注入] 推流停止门生效，拒绝启动推流: videoId={}", videoId);
             return false;
         }
         if (videoId == null || videoId.isBlank() || url == null || url.isBlank() || videoFile == null) {

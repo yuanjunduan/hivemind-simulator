@@ -1,0 +1,28 @@
+# 完整任务流场景：起飞 → 巡航 → 暂停 → 恢复 → 转场 → 返航 → 降落
+# 用途：E2E T04-T06（任务生命周期全链路）/ 平台侧任务状态机联调
+scenario:
+  id: normal-full-mission
+  version: 1
+  description: 完整任务流——含暂停/恢复/转场（5x 加速）
+  clock:
+    mode: accelerated
+    speed: 5
+
+devices:
+  - id: drone-001
+    vendor: DJI
+    deviceMode: DOCK
+    dockModel: DOCK3
+    droneModel: M4TD
+    initial:
+      battery: 90
+      online: true
+
+events:
+  - { at: 5s, action: takeoff, altitude: 60 }
+  - { at: 20s, action: goto, lng: 114.0579, lat: 22.5431, alt: 80, maxSpeed: 12 }
+  - { at: 60s, action: pause_mission }
+  - { at: 75s, action: resume_mission }
+  - { at: 90s, action: goto, lng: 114.0650, lat: 22.5480, alt: 100, maxSpeed: 10 }
+  - { at: 150s, action: return_home, rthAltitude: 100 }
+  - { at: 200s, action: land }

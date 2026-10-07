@@ -21,6 +21,7 @@ import jakarta.annotation.PreDestroy;
 import ltd.cdmi.hivemind.simulator.config.MqttProperties;
 import ltd.cdmi.hivemind.simulator.config.SimulatorProperties;
 import ltd.cdmi.hivemind.simulator.config.RuntimeConfig;
+import ltd.cdmi.hivemind.simulator.core.fault.NetworkFaultInjector;
 import ltd.cdmi.hivemind.simulator.device.DeviceMode;
 import ltd.cdmi.hivemind.simulator.diagnostic.DiagnosticCode;
 import ltd.cdmi.hivemind.simulator.diagnostic.MessageLogStore;
@@ -33,6 +34,7 @@ import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
@@ -49,6 +51,9 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * MQTT 客户端管理器：连接 EMQX、订阅下行 topic、分发消息、提供发布方法。
@@ -91,6 +96,12 @@ public class MqttClientManager implements MqttCallbackExtended {
     // 使用 ArrayDeque 而非 ArrayList：pollFirst() 是 O(1)，避免 ArrayList.remove(0) 的 O(n) 元素移动
     private final Deque<Map<String, Object>> messageLogs = new ArrayDeque<>();
 
+    /** 网络故障注入器（W2 T2.4；可选依赖——测试直接 new 时保持 null = 无注入） */
+    private volatile NetworkFaultInjector networkFaultInjector;
+
+    /** 故障注入延迟分发线程（懒初始化；@PreDestroy 关闭） */
+    private volatile ScheduledExecutorService faultDelayExecutor;
+
     public MqttClientManager(MqttProperties mqttProps, SimulatorProperties props, ObjectMapper objectMapper, RuntimeConfig runtimeConfig, DockTopicSchema dockTopicSchema, MessageLogStore messageLogStore) {
         this.mqttProps = mqttProps;
         this.props = props;
@@ -98,6 +109,31 @@ public class MqttClientManager implements MqttCallbackExtended {
         this.runtimeConfig = runtimeConfig;
         this.dockTopicSchema = dockTopicSchema;
         this.messageLogStore = messageLogStore;
+    }
+
+    /** 注入网络故障门（Spring 环境自动装配；测试直接 new 时保持 null） */
+    @Autowired(required = false)
+    public void setNetworkFaultInjector(NetworkFaultInjector injector) {
+        this.networkFaultInjector = injector;
+    }
+
+    /** 故障延迟分发线程（懒初始化，daemon 线程；未使用时不创建） */
+    private ScheduledExecutorService faultDelayExecutor() {
+        ScheduledExecutorService ex = faultDelayExecutor;
+        if (ex == null) {
+            synchronized (this) {
+                ex = faultDelayExecutor;
+                if (ex == null) {
+                    ex = Executors.newSingleThreadScheduledExecutor(r -> {
+                        Thread t = new Thread(r, "mqtt-fault-delay");
+                        t.setDaemon(true);
+                        return t;
+                    });
+                    faultDelayExecutor = ex;
+                }
+            }
+        }
+        return ex;
     }
 
     /**
@@ -258,6 +294,10 @@ public class MqttClientManager implements MqttCallbackExtended {
             if (client != null) {
                 client.close();
             }
+            ScheduledExecutorService ex = faultDelayExecutor;
+            if (ex != null) {
+                ex.shutdownNow();
+            }
             log.info("MQTT 客户端已关闭");
         } catch (Exception e) {
             log.warn("关闭 MQTT 客户端异常: {}", e.getMessage());
@@ -318,6 +358,27 @@ public class MqttClientManager implements MqttCallbackExtended {
     public void messageArrived(String topic, MqttMessage message) {
         String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
         log.debug("收到消息 topic={}, payload={}", topic, payload);
+
+        // 故障注入门（W2 T2.4）：断网/丢弃 → 吞掉；延迟 → 定时分发
+        NetworkFaultInjector fault = this.networkFaultInjector;
+        if (fault != null) {
+            if (fault.shouldDrop()) {
+                log.warn("[故障注入] 下行消息被丢弃 topic={}", topic);
+                addLog("fault-drop", topic, payload);
+                return;
+            }
+            long delay = fault.delayMillis();
+            if (delay > 0) {
+                log.info("[故障注入] 下行消息延迟 {}ms 分发 topic={}", delay, topic);
+                faultDelayExecutor().schedule(() -> dispatchMessage(topic, payload), delay, TimeUnit.MILLISECONDS);
+                return;
+            }
+        }
+        dispatchMessage(topic, payload);
+    }
+
+    /** 下行消息实际分发（经故障注入门之后） */
+    private void dispatchMessage(String topic, String payload) {
         addLog("recv", topic, payload);
 
         // 按 topic 精确匹配分发
@@ -369,6 +430,12 @@ public class MqttClientManager implements MqttCallbackExtended {
      * @param retained 是否保留消息
      */
     public void publish(String topic, String payload, int qos, boolean retained) {
+        NetworkFaultInjector fault = this.networkFaultInjector;
+        if (fault != null && fault.isDisconnected()) {
+            log.warn("[故障注入] 断网注入生效，上行消息未发送 topic={}", topic);
+            addLog("fault-drop", topic, payload);
+            return;
+        }
         if (client == null || !client.isConnected()) {
             log.warn("MQTT 未连接，丢弃消息 topic={}", topic);
             return;

@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+### 新增
+- **V3.0 改造 W1 Core 抽象层完成（T1.1-T1.10，PR-1~PR-11）**：新能力全部进 `core/`、`adapter/`、`web/` 新包；REALTIME 模式与 v1.4.6 行为等价（红线 2），回归 654 用例全绿（主量 640 + UniqueSnConfigTest 14 分段验证）
+  - `core/model` 统一模型（17 类，T1.1）：UnifiedDevice/UnifiedMission/Alarm 等跨厂商语义模型，厂商特有字段统一进 `vendorExt`；TC-CORE-001 JSON 往返测试
+  - `core/clock` 仿真时钟与统一调度器（T1.2，对齐 ADR-4/ADR-5）：REALTIME/加速统一实现（`setSpeed` 无缝 rebase、逻辑时间单调）、ClockScheduler（FIXED_RATE 按逻辑周期触发，单物理 tick 补发封顶 5 次防追帧卡死、超限跳帧；INTEGRATOR 每物理 tick 触发、任务内 dt 积分）、`simulation.*` 配置（mode/speed/tick-millis/fixed-rate-catchup-max/publish-rate-cap-hz，全部缺省兜底）；TC-CORE-010~015
+  - 调度点替换（T1.3，§2.3.4 六点）：DeviceSimulator 2s OSD、Wayline 3s 进度/500ms 插值/5s 返航延迟、DrcCommandHandler 杆量积分、FlightCommandSimulator flyto 一类改由 ClockScheduler 按逻辑时间驱动（替换调度源、不重写任务体——REALTIME 首帧语义与 `scheduleAtFixedRate` 一致，既有测试零修改全绿）
+  - `core/event` 事件总线（T1.4）：Spring ApplicationEventPublisher 门面（零新依赖）+ 5 类事件（DeviceLifecycleChanged/TelemetryUpdated/MissionProgress/AlarmRaised/FaultInjected，统一携带 deviceId + 逻辑时间戳）；TC-CORE-016~019
+  - `core/statemachine`（T1.5）：统一生命周期推导（观察者先行，ADR-8）与 `DjiStateMapper`（DJI mode_code → 生命周期映射，未命中组合发 M 级诊断码）；TC-CORE-020~031
+  - `core/engine/flight`（T1.6）：`FlightSimulationEngine` 接口 + `LiteFlightEngine`（水平/垂直/偏航/返航/云台动作抽取，速度参数化，公式与改造前逐位一致）+ `FlightIntent` 13 种飞行意图（sealed interface）；TC-CORE-040~047
+  - `core/engine/mission`（T1.7）：`MissionEngine` 接口 + `LiteMissionEngine`（load/start/pause/resume/cancel/advance/snapshot）+ `MissionPlan/MissionSnapshot`；DJI 步骤映射独立在 `adapter/dji/DjiMissionStepMapper`（6 步序列 + 阶段/进度映射，三版 Dock index 语义一致）；TC-CORE-050~058 / TC-ADP-020~026
+  - `core/engine/telemetry`（T1.8）：`TelemetryEngine`（最新统一快照 + TelemetryUpdatedEvent）+ `DjiTelemetryProjector`（DeviceState → UnifiedDevice 投影，publishOsd 末尾一行钩子）+ WebSocket 端点（0.5Hz 推送）+ `/api/unified/devices` REST；TC-CORE-060~067 / TC-CORE-070~075 / TC-ADP-001~012B
+  - `adapter/dji` 上下行（T1.9）：`DjiFlightIntentHandler`（意图 → 既有内部执行路径映射；内部入口方法新增不改原方法）+ `POST /api/unified/devices/{deviceId}/intents` 统一意图 API + `FlightIntent` Jackson 多态（type 判别）；TC-ADP-013~019 / TC-CORE-080~083
+  - 加速报文频率封顶（T1.10，ADR-5）：`PublishRateGate`（物理时间间隔封顶，REALTIME 恒定放行）+ `DeviceSimulator.publishOsd` 整轮节流（加速下 OSD/DRC 批推送 ≤ `simulation.mqtt.publish-rate-cap-hz`；离散事件不降采样）；TC-CORE-090~091 / TC-INT-001（10x 下 18s 逻辑任务流 ≈1.8s 物理完成，6 步进度事件齐全）
+- **时钟运行时控制 REST 端点（W2 前置小项）**：`GET /api/unified/clock`（倍率/逻辑时间/墙钟度量快照，时间为 ISO-8601）+ `POST /api/unified/clock/speed`（倍率热切换，非法值 400 且不改变当前倍率）——供 W2 场景引擎、E2E 编排、真实平台联调与 W5 控制面板使用，替代“改 yml + 重启”的过渡期切换方式；TC-CORE-092（回归 644+14 用例全绿）
+
+### 设计说明
+- **回归基线与测试环境**：`mvn test` 需配 `SIMULATOR_CONFIG_DIR=build/cfg-t15`；`UniqueSnConfigTest`（14 例）置最后单独执行（其写 live-config.json 会污染同批其他用例）；不配上述环境变量时本机 `~/.hivemind-simulator/live-config.json` 残留（token 空串）会使 PilotConfigTest 2 例失败（W0 已定性，非代码缺陷）
+- **API 契约（W2 依赖）**：`FlightIntent` JSON `type` 字段（记录类简单名，如 `Goto`/`ExecuteWaypoints`）13 种意图全支持；未接入执行路径的意图（Hover/SetSpeed/SetAltitude/Yaw/Arm/Disarm）返回 `accepted=false`（W2 场景引擎扩展），设备不存在返回 404；`MissionPlan.ext` 预留 `rthAltitude` 等航段参数通道
+- 现有调度器与协议路径已全部接入新调度源（T1.3 完成），REALTIME 等价红线保持
+
 ## [v1.4.6] - 2026-08-31
 
 ### 修复

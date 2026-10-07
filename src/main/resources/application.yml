@@ -24,6 +24,24 @@ mqtt:
   simulator-client-id-prefix: dock-sim-
   monitor-client-id-prefix: monitor-
 
+# ========================================
+# V3.0 仿真时钟与统一调度（core/clock，实施方案 §2.3/§2.10）
+# clock.mode: realtime（缺省，行为与 v1.4.6 逐位等价）| accelerated（按 speed 倍率推进逻辑时间）
+# clock.speed: 加速倍率（仅 accelerated 生效，建议 1/2/5/10/50/100）
+# scheduler.tick-millis: 物理 tick 周期（与倍率无关）
+# scheduler.fixed-rate-catchup-max: 单物理 tick 内 FIXED_RATE 任务最大补发次数（防追帧卡死）
+# mqtt.publish-rate-cap-hz: 加速模式下 MQTT 报文频率封顶（ADR-5；realtime 不生效）
+# ========================================
+simulation:
+  clock:
+    mode: realtime
+    speed: 1.0
+  scheduler:
+    tick-millis: 100
+    fixed-rate-catchup-max: 5
+  mqtt:
+    publish-rate-cap-hz: 2
+
 simulator:
   # SN 生成模式（设计文档 §7.1，TDD-SPEC TC-REG-028~031）
   # unique-enabled: false（缺省）SN 取设备型号 defaultSn()，单实例调试用
